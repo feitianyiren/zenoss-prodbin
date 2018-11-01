@@ -1,45 +1,428 @@
+#! /usr/bin/env python
 ##############################################################################
 #
-# Copyright (C) Zenoss, Inc. 2008, all rights reserved.
+# Copyright (C) Zenoss, Inc. 2008, 2018 all rights reserved.
 #
 # This content is made available according to terms specified in
 # License.zenoss under the directory where your Zenoss product is installed.
 #
 ##############################################################################
 
+import logging
+import os
+import signal
+import time
+
+from collections import defaultdict
+from contextlib import contextmanager
+from optparse import SUPPRESS_HELP
+
+from metrology import Metrology
+from twisted.application.internet import ClientService, backoffPolicy
+from twisted.cred.credentials import UsernamePassword
+from twisted.internet.endpoints import clientFromString
+from twisted.internet import defer, reactor, error
+from twisted.spread import pb
 
 import Globals
+
+from Products.DataCollector.plugins import DataMaps
 from Products.DataCollector.Plugins import loadPlugins
 from Products.ZenHub import PB_PORT
 from Products.ZenHub.metricmanager import MetricManager
-from Products.ZenHub.zenhub import LastCallReturnValue
-from Products.ZenHub.PBDaemon import translateError, RemoteConflictError
-from Products.ZenUtils.Time import isoDateTime
-from Products.ZenUtils.ZCmdBase import ZCmdBase
-from Products.ZenUtils.Utils import unused, zenPath, atomicWrite
-from Products.ZenUtils.PBUtil import ReconnectingPBClientFactory
-# required to allow modeling with zenhubworker
-from Products.DataCollector.plugins import DataMaps
-unused(DataMaps)
-
-from twisted.cred import credentials
-from twisted.spread import pb
-from twisted.internet import defer, reactor, error
-from ZODB.POSException import ConflictError
-from collections import defaultdict
-from optparse import SUPPRESS_HELP
-
-import cPickle as pickle
-import logging
-import time
-import signal
-import os
-from metrology import Metrology
-
+from Products.ZenHub.servicemanager import (
+    HubServiceRegistry, UnknownServiceError
+)
+from Products.ZenHub.PBDaemon import RemoteConflictError, RemoteBadMonitor
 from Products.ZenUtils.debugtools import ContinuousProfiler
+from Products.ZenUtils.Time import isoDateTime
+from Products.ZenUtils.Utils import unused, zenPath, atomicWrite
+from Products.ZenUtils.ZCmdBase import ZCmdBase
 
+unused(Globals, DataMaps)
 
 IDLE = "None/None"
+
+
+def getLogger(cls):
+    name = "zen.zenhubworker.%s" % (cls.__name__)
+    return logging.getLogger(name)
+
+
+class ZenHubWorker(ZCmdBase, pb.Referenceable):
+    """Execute ZenHub requests.
+    """
+
+    mname = name = "zenhubworker"
+
+    def __init__(self):
+        ZCmdBase.__init__(self)
+
+        if self.options.profiling:
+            self.profiler = ContinuousProfiler('ZenHubWorker', log=self.log)
+            self.profiler.start()
+            reactor.addSystemEventTrigger(
+                'before', 'shutdown', self.profiler.stop
+            )
+
+        self.current = IDLE
+        self.currentStart = 0
+        self.numCalls = Metrology.meter("zenhub.workerCalls")
+
+        self.zem = self.dmd.ZenEventManager
+        loadPlugins(self.dmd)
+
+        serviceFactory = ServiceReferenceFactory(self)
+        self.__registry = HubServiceRegistry(self.dmd, serviceFactory)
+
+        creds = UsernamePassword(
+            self.options.hubusername, self.options.hubpassword
+        )
+        self.__client = ZenHubClient(
+            reactor, self.options.hubhost, self.options.hubport, creds,
+            self, self.options.workerid
+        )
+
+        # Setup Metric Reporting
+        self.log.debug("Creating async MetricReporter")
+        self._metric_manager = MetricManager(
+            daemon_tags={
+                'zenoss_daemon': 'zenhub_worker_%s' % self.options.workerid,
+                'zenoss_monitor': self.options.monitor,
+                'internal': True
+            })
+
+    def start(self, reactor):
+        """
+        """
+        self.log.debug("establishing SIGUSR1 signal handler")
+        signal.signal(signal.SIGUSR1, self.sighandler_USR1)
+        self.log.debug("establishing SIGUSR2 signal handler")
+        signal.signal(signal.SIGUSR2, self.sighandler_USR2)
+
+        self.__client.start()
+        reactor.addSystemEventTrigger(
+            'before', 'shutdown', self.__client.stop
+        )
+
+        self._metric_manager.start()
+        reactor.addSystemEventTrigger(
+            'before', 'shutdown', self._metric_manager.stop
+        )
+
+        reactor.addSystemEventTrigger("after", "shutdown", self.reportStats)
+
+    def audit(self, action):
+        """ZenHubWorkers restart all the time, it is not necessary to
+        audit log it.
+        """
+        pass
+
+    def setupLogging(self):
+        """Override setupLogging to add instance id/count information to
+        all log messages.
+        """
+        super(ZenHubWorker, self).setupLogging()
+        instanceInfo = "(%s)" % (self.options.workerid,)
+        template = (
+            "%%(asctime)s %%(levelname)s %%(name)s: %s %%(message)s"
+        ) % instanceInfo
+        rootLog = logging.getLogger()
+        formatter = logging.Formatter(template)
+        for handler in rootLog.handlers:
+            handler.setFormatter(formatter)
+
+    def sighandler_USR1(self, signum, frame):
+        try:
+            if self.options.profiling:
+                self.profiler.dump_stats()
+            super(ZenHubWorker, self).sighandler_USR1(signum, frame)
+        except Exception:
+            pass
+
+    def sighandler_USR2(self, *args):
+        try:
+            self.reportStats()
+        except Exception:
+            pass
+
+    def work_started(self, startTime):
+        self.currentStart = startTime
+        self.numCalls.mark()
+
+    def work_finished(self, duration, method):
+        self.log.debug("Time in %s: %.2f", method, duration)
+        self.current = IDLE
+        self.currentStart = 0
+        if self.numCalls.count >= self.options.call_limit:
+            reactor.callLater(0, self._shutdown)
+
+    def reportStats(self):
+        now = time.time()
+        if self.current != IDLE:
+            self.log.info(
+                "Currently performing %s, elapsed %.2f s",
+                self.current, now-self.currentStart
+            )
+        else:
+            self.log.info("Currently IDLE")
+        if self.__registry:
+            loglines = ["Running statistics:"]
+            sorted_data = sorted(
+                self.__registry.iteritems(),
+                key=lambda kvp: (kvp[0][1], kvp[0][0].rpartition('.')[-1])
+            )
+            for svc, svcob in sorted_data:
+                svc = "%s/%s" % (svc[1], svc[0].rpartition('.')[-1])
+                for method, stats in sorted(svcob.callStats.items()):
+                    loglines.append(
+                        " - %-48s %-32s %8d %12.2f %8.2f %s" % (
+                            svc, method,
+                            stats.numoccurrences,
+                            stats.totaltime,
+                            stats.totaltime/stats.numoccurrences
+                            if stats.numoccurrences else 0.0,
+                            isoDateTime(stats.lasttime)
+                        )
+                    )
+            self.log.info('\n'.join(loglines))
+        else:
+            self.log.info("no service activity statistics")
+
+    def remote_reportStatus(self):
+        """Remote command to report the worker's current status to the log.
+        """
+        try:
+            self.reportStats()
+        except Exception:
+            self.log.exception("Failed to report status")
+
+    def remote_getService(self, name, monitor):
+        """Return a reference to the named service.
+
+        @param name {str} Name of the service to load
+        @param monitor {str} Name of the collection monitor
+        """
+        try:
+            return self.__registry.getService(name, monitor)
+        except RemoteBadMonitor:
+            # Catch and rethrow this Exception dervived exception.
+            raise
+        except UnknownServiceError:
+            self.log.error("Service '%s' not found", name)
+            raise
+        except Exception as ex:
+            self.log.exception("Failed to get service '%s'", name)
+            raise pb.Error(str(ex))
+
+    def _shutdown(self):
+        self.log.info("Shutting down")
+        try:
+            reactor.stop()
+        except error.ReactorNotRunning:
+            pass
+
+    def buildOptions(self):
+        """Options, mostly to find where zenhub lives
+        These options should be passed (by file) from zenhub.
+        """
+        ZCmdBase.buildOptions(self)
+        self.parser.add_option(
+            '--hubhost', dest='hubhost', default='localhost',
+            help="Host to use for connecting to ZenHub"
+        )
+        self.parser.add_option(
+            '--hubport', dest='hubport', type='int', default=PB_PORT,
+            help="Port to use for connecting to ZenHub"
+        )
+        self.parser.add_option(
+            '--hubusername', dest='hubusername', default='admin',
+            help="Login name to use when connecting to ZenHub"
+        )
+        self.parser.add_option(
+            '--hubpassword', dest='hubpassword', default='zenoss',
+            help="password to use when connecting to ZenHub"
+        )
+        self.parser.add_option(
+            '--call-limit', dest='call_limit', type='int', default=200,
+            help="Maximum number of remote calls before restarting worker"
+        )
+        self.parser.add_option(
+            '--profiling', dest='profiling',
+            action='store_true', default=False, help="Run with profiling on"
+        )
+        self.parser.add_option(
+            '--monitor', dest='monitor', default='localhost',
+            help='Name of the performance monitor this hub runs on'
+        )
+        self.parser.add_option(
+            '--workerid', dest='workerid', type='int', default=0,
+            help=SUPPRESS_HELP
+        )
+
+
+class ZenHubClient(object):
+    """Implements a client for connecting to ZenHub as a ZenHub Worker.
+    """
+
+    def __init__(self, reactor, host, port, credentials, worker, workerId):
+        """Initializes a ZenHubClient instance.
+
+        @param reactor {IReactorCore}
+        @param host {str} Hostname where ZenHub is running
+        @param port {int} Port where ZenHub is listening.
+        @param credentials {IUsernamePassword} Credentials to log into ZenHub.
+        @param worker {IReferenceable} Reference to worker
+        """
+        self.__log = getLogger(type(self))
+        self.__credentials = credentials
+        self.__worker = worker
+        self.__workerId = workerId
+        factory = pb.PBClientFactory()
+        endpointDescriptor = "tcp:{host}:{port}".format(
+            host=host, port=port
+        )
+        endpoint = clientFromString(reactor, endpointDescriptor)
+        self.__service = ClientService(
+            endpoint, factory,
+            retryPolicy=backoffPolicy(initialDelay=0.5, factor=3.0)
+        )
+
+    def start(self):
+        self.__prepForConnection()
+        self.__service.startService()
+
+    def stop(self):
+        self.__service.stopService()
+
+    def __prepForConnection(self):
+        self.__service.whenConnected().addCallback(self.__connected)
+
+    def __disconnected(self, *args):
+        """Called when the connection to ZenHub is lost.
+
+        Ensures that processing resumes when the connection to ZenHub
+        is restored.
+        """
+        self.__log.info("Lost connection to ZenHub")
+        self.__prepForConnection()
+
+    @defer.inlineCallbacks
+    def __connected(self, broker):
+        """Called when a connection to ZenHub is established.
+
+        Logs into ZenHub and passes up a worker reference for ZenHub
+        to use to dispatch method calls.
+        """
+        broker.notifyOnDisconnect(self.__disconnected)
+        try:
+            filename = "zenhub_connected"
+            signalFilePath = zenPath('var', filename)
+
+            zenhub = yield broker.factory.login(
+                self.__credentials, self.__worker
+            )
+            yield zenhub.callRemote(
+                "reportingForWork", self.__worker, workerId=self.__workerId
+            )
+        except Exception as ex:
+            self.__log.error("Unable to report for work: %s", ex)
+            self.__log.debug('Removing file at %s', signalFilePath)
+            try:
+                os.remove(signalFilePath)
+            except Exception:
+                pass
+            reactor.stop()
+        else:
+            self.__log.info("Connected to ZenHub")
+            self.__log.debug('Writing file at %s', signalFilePath)
+            atomicWrite(signalFilePath, '')
+
+
+class ServiceReferenceFactory(object):
+    """This is a factory that builds ServiceReference objects.
+    """
+
+    def __init__(self, worker):
+        """Initializes an instance of ServiceReferenceFactory.
+
+        @param worker {ZenHubWorker}
+        """
+        self.__worker = worker
+
+    def build(self, service, name, monitor):
+        """Build and return a ServiceReference object.
+
+        @param service {HubService derived} Service object
+        @param name {string} Name of the service
+        @param monitor {string} Name of the performance monitor (collector)
+        """
+        return ServiceReference(service, name, monitor, self.__worker)
+
+
+class ServiceReference(pb.Referenceable):
+    """
+    """
+
+    def __init__(self, service, name, monitor, worker):
+        """
+        """
+        self.__name = name
+        self.__monitor = monitor
+        self.__service = service
+        self.__worker = worker
+        self.callStats = defaultdict(_CumulativeWorkerStats)
+        self.debug = False
+
+    @property
+    def name(self):
+        return self.__name
+
+    @property
+    def monitor(self):
+        return self.__monitor
+
+    @defer.inlineCallbacks
+    def remoteMessageReceived(self, broker, message, args, kw):
+        """
+        """
+        with self.__update_stats(message):
+            for i in range(4):
+                try:
+                    yield self.__worker.async_syncdb()
+                except RemoteConflictError:
+                    pass
+
+                try:
+                    result = yield self.__service.remoteMessageReceived(
+                        broker, message, args, kw
+                    )
+                    defer.returnValue(result)
+                except RemoteConflictError:
+                    pass  # continue
+            else:
+                result = yield self.__service.remoteMessageReceived(
+                    broker, message, args, kw
+                )
+                defer.returnValue(result)
+
+    @contextmanager
+    def __update_stats(self, method):
+        """
+        @param method {str} Remote method name on service.
+        """
+        try:
+            name = self.__name.rpartition('.')[-1]
+            self.__worker.current = "%s/%s" % (name, method)
+            start = time.time()
+            self.__worker.work_started(start)
+            yield self.__service
+        finally:
+            finish = time.time()
+            secs = finish - start
+            self.callStats[method].addOccurrence(secs, finish)
+            self.__service.callTime += secs
+            self.__worker.work_finished(secs, method)
 
 
 class _CumulativeWorkerStats(object):
@@ -60,296 +443,7 @@ class _CumulativeWorkerStats(object):
         self.lasttime = now
 
 
-class zenhubworker(ZCmdBase, pb.Referenceable):
-    "Execute ZenHub requests in separate process"
-
-    def __init__(self):
-        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
-        ZCmdBase.__init__(self)
-        if self.options.profiling:
-            self.profiler = ContinuousProfiler('zenhubworker', log=self.log)
-            self.profiler.start()
-        self.current = IDLE
-        self.currentStart = 0
-        self.numCalls = Metrology.meter("zenhub.workerCalls")
-        try:
-            self.log.debug("establishing SIGUSR1 signal handler")
-            signal.signal(signal.SIGUSR1, self.sighandler_USR1)
-            self.log.debug("establishing SIGUSR2 signal handler")
-            signal.signal(signal.SIGUSR2, self.sighandler_USR2)
-        except ValueError:
-            # If we get called multiple times, this will generate an exception:
-            # ValueError: signal only works in main thread
-            # Ignore it as we've already set up the signal handler.
-            pass
-
-        self.zem = self.dmd.ZenEventManager
-        loadPlugins(self.dmd)
-        self.services = {}
-        factory = ReconnectingPBClientFactory(pingPerspective=False)
-        self.log.debug("Connecting to %s:%d",
-                       self.options.hubhost,
-                       self.options.hubport)
-        reactor.connectTCP(self.options.hubhost, self.options.hubport, factory)
-        self.log.debug("Logging in as %s", self.options.hubusername)
-        c = credentials.UsernamePassword(self.options.hubusername,
-                                         self.options.hubpassword)
-        factory.gotPerspective = self.gotPerspective
-        def stop(*args):
-            reactor.callLater(0, reactor.stop)
-        factory.clientConnectionLost = stop
-        factory.setCredentials(c)
-
-        # Setup Metric Reporting
-        self.log.debug("Creating async MetricReporter")
-        self._metric_manager = MetricManager(
-            daemon_tags={
-                'zenoss_daemon': 'zenhub_worker_%s' % self.options.workerid,
-                'zenoss_monitor': self.options.monitor,
-                'internal': True
-            })
-        self._metric_manager.start()
-        reactor.addSystemEventTrigger(
-            'before', 'shutdown', self._metric_manager.stop
-        )
-
-    def audit(self, action):
-        """
-        zenhubworkers restart all the time, it is not necessary to audit log it.
-        """
-        pass
-
-    def setupLogging(self):
-        """Override setupLogging to add instance id/count information to
-        all log messages.
-        """
-        super(zenhubworker, self).setupLogging()
-        instanceInfo = "(%s)" % (self.options.workerid,)
-        template = (
-            "%%(asctime)s %%(levelname)s %%(name)s: %s %%(message)s"
-        ) % instanceInfo
-        rootLog = logging.getLogger()
-        formatter = logging.Formatter(template)
-        for handler in rootLog.handlers:
-            handler.setFormatter(formatter)
-
-    def sighandler_USR1(self, signum, frame):
-        try:
-            if self.options.profiling:
-                self.profiler.dump_stats()
-            super(zenhubworker, self).sighandler_USR1(signum, frame)
-        except:
-            pass
-
-    def sighandler_USR2(self, *args):
-        try:
-            self.reportStats()
-        except:
-            pass
-
-    def reportStats(self):
-        now = time.time()
-        if self.current != IDLE:
-            self.log.debug(
-                "Currently performing %s, elapsed %.2f s",
-                self.current, now-self.currentStart
-            )
-        else:
-            self.log.debug("Currently IDLE")
-        if self.services:
-            loglines = ["Running statistics:"]
-            for svc,svcob in sorted(self.services.iteritems(), key=lambda kvp:(kvp[0][1], kvp[0][0].rpartition('.')[-1])):
-                svc = "%s/%s" % (svc[1], svc[0].rpartition('.')[-1])
-                for method,stats in sorted(svcob.callStats.items()):
-                    loglines.append(" - %-48s %-32s %8d %12.2f %8.2f %s" %
-                                    (svc, method,
-                                     stats.numoccurrences,
-                                     stats.totaltime,
-                                     stats.totaltime/stats.numoccurrences if stats.numoccurrences else 0.0,
-                                     isoDateTime(stats.lasttime)))
-            self.log.debug('\n'.join(loglines))
-        else:
-            self.log.debug("no service activity statistics")
-
-    def gotPerspective(self, perspective):
-        """Once we are connected to zenhub, register ourselves"""
-        d = perspective.callRemote(
-            'reportingForWork', self, workerId=self.options.workerid
-        )
-
-        filename = 'zenhub_connected'
-        signalFilePath = zenPath('var', filename)
-
-        def reportSuccess(args):
-            self.log.debug('Writing file at %s', signalFilePath)
-            atomicWrite(signalFilePath, '')
-
-        def reportProblem(why):
-            self.log.error("Unable to report for work: %s", why)
-            self.log.debug('Removing file at %s', signalFilePath)
-            try:
-                os.remove(signalFilePath)
-            except Exception:
-                pass
-            reactor.stop()
-
-        d.addCallback(reportSuccess)
-        d.addErrback(reportProblem)
-
-    def _getService(self, name, instance):
-        """Utility method to create the service (like PingConfig)
-        for instance (like localhost)
-
-        @type name: string
-        @param name: the dotted-name of the module to load
-        (uses @L{Products.ZenUtils.Utils.importClass})
-        @param instance: string
-        @param instance: each service serves only one specific collector instances (like 'localhost').  instance defines the collector's instance name.
-        @return: a service loaded from ZenHub/services or one of the zenpacks.
-        """
-        try:
-            return self.services[name, instance]
-        except KeyError:
-            from Products.ZenUtils.Utils import importClass
-            try:
-                ctor = importClass(name)
-            except ImportError:
-                ctor = importClass('Products.ZenHub.services.%s' % name, name)
-            svc = ctor(self.dmd, instance)
-            self.services[name, instance] = svc
-
-            # dict for tracking statistics on method calls invoked on this service,
-            # including number of times called and total elapsed time, keyed
-            # by method name
-            svc.callStats = defaultdict(_CumulativeWorkerStats)
-
-            return svc
-
-    @translateError
-    @defer.inlineCallbacks
-    def remote_execute(self, service, instance, method, args):
-        """Execute requests on behalf of zenhub
-        @type service: string
-        @param service: the name of a service, like PingConfig
-
-        @type instance: string
-        @param instance: each service serves only one specific collector instances (like 'localhost').  instance defines the collector's instance name.
-
-        @type method: string
-        @param method: the name of the called method, like getPingTree
-
-        @type args: tuple
-        @param args: arguments to the method
-
-        @type kw: dictionary
-        @param kw: keyword arguments to the method
-        """
-        svcstr = service.rpartition('.')[-1]
-        self.current = "%s/%s" % (svcstr, method)
-        self.log.debug("Servicing %s in %s", method, service)
-        now = time.time()
-        self.currentStart = now
-        try:
-            yield self.async_syncdb()
-        except RemoteConflictError, ex:
-            pass
-        service = self._getService(service, instance)
-        m = getattr(service, 'remote_' + method)
-        # now that the service is loaded, we can unpack the arguments
-        joinedArgs = "".join(args)
-        args, kw = pickle.loads(joinedArgs)
-
-        # see if this is our last call
-        self.numCalls.mark()
-        lastCall = self.numCalls.count >= self.options.call_limit
-
-        def runOnce():
-            res = m(*args, **kw)
-            if lastCall:
-                res = LastCallReturnValue(res)
-            pickled_res = pickle.dumps(res, pickle.HIGHEST_PROTOCOL)
-            chunkedres=[]
-            chunkSize = 102400
-            while pickled_res:
-                chunkedres.append(pickled_res[:chunkSize])
-                pickled_res = pickled_res[chunkSize:]
-            return chunkedres
-        try:
-            for i in range(4):
-                try:
-                    if i > 0:
-                        #only sync for retries as it already happened above
-                        yield self.async_syncdb()
-                    result = runOnce()
-                    defer.returnValue(result)
-                except RemoteConflictError, ex:
-                    pass
-            # one last try, but don't hide the exception
-            yield self.async_syncdb()
-            result = runOnce()
-            defer.returnValue(result)
-        finally:
-            finishTime = time.time()
-            secs = finishTime - now
-            self.log.debug("Time in %s: %.2f", method, secs)
-            # update call stats for this method on this service
-            service.callStats[method].addOccurrence(secs, finishTime)
-            service.callTime += secs
-            self.current = IDLE
-
-            if lastCall:
-                reactor.callLater(1, self._shutdown)
-
-    def _shutdown(self):
-        self.log.info("Shutting down")
-        self.reportStats()
-        self.log.info("Stopping reactor")
-        if self.options.profiling:
-            self.profiler.stop()
-        try:
-            reactor.stop()
-        except error.ReactorNotRunning:
-            pass
-
-    def buildOptions(self):
-        """Options, mostly to find where zenhub lives
-        These options should be passed (by file) from zenhub.
-        """
-        ZCmdBase.buildOptions(self)
-        self.parser.add_option('--hubhost',
-                               dest='hubhost',
-                               default='localhost',
-                               help="Host to use for connecting to ZenHub")
-        self.parser.add_option('--hubport',
-                               dest='hubport',
-                               type='int',
-                               help="Port to use for connecting to ZenHub",
-                               default=PB_PORT)
-        self.parser.add_option('--hubusername',
-                               dest='hubusername',
-                               help="Login name to use when connecting to ZenHub",
-                               default='admin')
-        self.parser.add_option('--hubpassword',
-                               dest='hubpassword',
-                               help="password to use when connecting to ZenHub",
-                               default='zenoss')
-        self.parser.add_option('--call-limit',
-                               dest='call_limit',
-                               type='int',
-                               help="Maximum number of remote calls before restarting worker",
-                               default=200)
-        self.parser.add_option('--profiling', dest='profiling',
-                               action='store_true', default=False,
-                               help="Run with profiling on")
-        self.parser.add_option('--monitor', dest='monitor',
-                               default='localhost',
-                               help='Name of the distributed monitor this hub runs on')
-        self.parser.add_option('--workerid',
-                               dest='workerid',
-                               type='int',
-                               default=0,
-                               help=SUPPRESS_HELP)
-
 if __name__ == '__main__':
-    zhw = zenhubworker()
+    zhw = ZenHubWorker()
+    zhw.start(reactor)
     reactor.run()

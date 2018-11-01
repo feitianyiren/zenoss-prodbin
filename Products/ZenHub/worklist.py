@@ -308,3 +308,21 @@ class ZenHubWorklist(object):
         """
         priority = _message_priority_map.get(job.method)
         self.__worklists.get(priority).append(job)
+
+
+class ModelingPaused(object):
+    """ModelingPaused is a simple boolean predicate that returns True if
+    modeling (i.e. applyDataMaps processing) is paused.
+    """
+
+    def __init__(self, ctx, modeling_pause_timeout):
+        """Initialize a ModelingPaused instance.
+
+        @param ctx {dmd} Reference to dmd.
+        @param modeling_pause_timeout {float} Duration of modeling pause
+        """
+        self.__ctx = ctx
+        self.__modeling_pause_timeout = modeling_pause_timeout
+
+    def __call__(self):
+        return self.__ctx.getPauseADMLife() <= self.__modeling_pause_timeout
