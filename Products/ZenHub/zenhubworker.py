@@ -65,6 +65,7 @@ class ZenHubWorker(ZCmdBase, pb.Referenceable):
                 'before', 'shutdown', self.profiler.stop
             )
 
+        self.instanceId = self.options.workerid
         self.current = IDLE
         self.currentStart = 0
         self.numCalls = Metrology.meter("zenhub.workerCalls")
@@ -75,13 +76,15 @@ class ZenHubWorker(ZCmdBase, pb.Referenceable):
         serviceFactory = ServiceReferenceFactory(self)
         self.__registry = HubServiceRegistry(self.dmd, serviceFactory)
 
+        # Configure/initialize the ZenHub client
         creds = UsernamePassword(
             self.options.hubusername, self.options.hubpassword
         )
-        self.__client = ZenHubClient(
-            reactor, self.options.hubhost, self.options.hubport, creds,
-            self, self.options.workerid
+        endpointDescriptor = "tcp:{host}:{port}".format(
+            host=self.options.hubhost, port=self.options.hubport
         )
+        endpoint = clientFromString(reactor, endpointDescriptor)
+        self.__client = ZenHubClient(reactor, endpoint, creds, self)
 
         # Setup Metric Reporting
         self.log.debug("Creating async MetricReporter")
@@ -265,38 +268,36 @@ class ZenHubClient(object):
     """Implements a client for connecting to ZenHub as a ZenHub Worker.
     """
 
-    def __init__(self, reactor, host, port, credentials, worker, workerId):
+    def __init__(self, reactor, endpoint, credentials, worker):
         """Initializes a ZenHubClient instance.
 
         @param reactor {IReactorCore}
-        @param host {str} Hostname where ZenHub is running
-        @param port {int} Port where ZenHub is listening.
+        @param endpoint {IStreamClientEndpoint} Where zenhub is found
         @param credentials {IUsernamePassword} Credentials to log into ZenHub.
         @param worker {IReferenceable} Reference to worker
         """
         self.__log = getLogger(type(self))
         self.__credentials = credentials
         self.__worker = worker
-        self.__workerId = workerId
+        self.__stopping = False
         factory = pb.PBClientFactory()
-        endpointDescriptor = "tcp:{host}:{port}".format(
-            host=host, port=port
-        )
-        endpoint = clientFromString(reactor, endpointDescriptor)
         self.__service = ClientService(
             endpoint, factory,
             retryPolicy=backoffPolicy(initialDelay=0.5, factor=3.0)
         )
 
     def start(self):
-        self.__prepForConnection()
         self.__service.startService()
+        self.__prepForConnection()
 
     def stop(self):
+        self.__stopping = True
         self.__service.stopService()
 
     def __prepForConnection(self):
-        self.__service.whenConnected().addCallback(self.__connected)
+        if not self.__stopping:
+            self.__log.info("Prepping for connection")
+            self.__service.whenConnected().addCallback(self.__connected)
 
     def __disconnected(self, *args):
         """Called when the connection to ZenHub is lost.
@@ -304,7 +305,7 @@ class ZenHubClient(object):
         Ensures that processing resumes when the connection to ZenHub
         is restored.
         """
-        self.__log.info("Lost connection to ZenHub")
+        self.__log.info("Lost connection to ZenHub: %r", args)
         self.__prepForConnection()
 
     @defer.inlineCallbacks
@@ -314,7 +315,7 @@ class ZenHubClient(object):
         Logs into ZenHub and passes up a worker reference for ZenHub
         to use to dispatch method calls.
         """
-        broker.notifyOnDisconnect(self.__disconnected)
+        self.__log.info("Connection to ZenHub established")
         try:
             filename = "zenhub_connected"
             signalFilePath = zenPath('var', filename)
@@ -323,7 +324,8 @@ class ZenHubClient(object):
                 self.__credentials, self.__worker
             )
             yield zenhub.callRemote(
-                "reportingForWork", self.__worker, workerId=self.__workerId
+                "reportingForWork",
+                self.__worker, workerId=self.__worker.instanceId
             )
         except Exception as ex:
             self.__log.error("Unable to report for work: %s", ex)
@@ -334,9 +336,13 @@ class ZenHubClient(object):
                 pass
             reactor.stop()
         else:
-            self.__log.info("Connected to ZenHub")
+            self.__log.info("Logged into ZenHub")
             self.__log.debug('Writing file at %s', signalFilePath)
             atomicWrite(signalFilePath, '')
+
+            # Connection complete; install a listener to be notified if
+            # the connection is lost.
+            broker.notifyOnDisconnect(self.__disconnected)
 
 
 class ServiceReferenceFactory(object):

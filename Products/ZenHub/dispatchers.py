@@ -194,6 +194,7 @@ class WorkerPoolDispatcher(object):
         #    ...
         # }
         self.__workers = {}
+        self.__readyworkers = []
         self.__workTracker = {}
         self.__executionTimer = collections.defaultdict(ExecutionStats)
 
@@ -222,12 +223,21 @@ class WorkerPoolDispatcher(object):
         """
         if worker not in self.__workers:
             self.__workers[worker] = {}
+            self.__log.info(
+                "Adding Worker %s to readyworkers", worker.workerId
+            )
+            self.__readyworkers.append(worker)
 
     def remove(self, worker):
         """Remove a worker from the pool.
         """
         if worker in self.__workers:
+            self.__log.info(
+                "Removing Worker %s", worker.workerId
+            )
             del self.__workers[worker]
+            if worker in self.__readyworkers:
+                self.__readyworkers.pop(self.__readyworkers.index(worker))
 
     def __contains__(self, worker):
         """Returns True if worker is registered, else False is returned.
@@ -265,17 +275,36 @@ class WorkerPoolDispatcher(object):
         if not self.__worklist:
             defer.returnValue(None)
 
+        self.__log.info("worklist length is %s", len(self.__worklist))
+
         # Find a worker that's not busy.
-        worker = next((
-            worker for worker in self.__workers if not worker.busy
-        ), None)
-        if worker is None:
+        if not self.__readyworkers:
             # If all workers are busy, try again later.
             self.__reactor.callLater(0.1, self.__execute)
             defer.returnValue(None)
 
+        self.__log.info(
+            "readyworkers contains %s workers: %s",
+            len(self.__readyworkers),
+            ", ".join(str(w.workerId) for w in self.__readyworkers)
+        )
+        worker = self.__readyworkers.pop(0)
+
+        # worker = next((
+        #     worker for worker in self.__workers if not worker.busy
+        # ), None)
+        # if worker is None:
+        #     # If all workers are busy, try again later.
+        #     self.__reactor.callLater(0.1, self.__execute)
+        #     defer.returnValue(None)
+
         asyncjob = self.__worklist.pop()
         job = asyncjob.job
+
+        self.__log.info(
+            "Worker %s starting job %s.%s",
+            worker.workerId, job.service, job.method
+        )
 
         try:
             self.__beginWork(worker, job)
@@ -316,6 +345,11 @@ class WorkerPoolDispatcher(object):
 
         finally:
             self.__endWork(worker, job)
+            self.__log.info(
+                "Worker %s   ending job %s.%s",
+                worker.workerId, job.service, job.method
+            )
+            self.__readyworkers.append(worker)
 
     def __beginWork(self, worker, job):
         now = time.time()

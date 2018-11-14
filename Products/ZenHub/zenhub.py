@@ -29,7 +29,7 @@ from zope.component import getUtility, adapts
 from zope.event import notify
 from zope.interface import implements
 
-# Import Globals before any zenhub Products
+# Import Globals before any Zenoss Products
 import Globals
 
 from Products.ZenUtils.Utils import (
@@ -37,7 +37,6 @@ from Products.ZenUtils.Utils import (
 )
 from Products.ZenUtils.ZCmdBase import ZCmdBase
 from Products.ZenUtils.debugtools import ContinuousProfiler
-# from Products.DataCollector.Plugins import loadPlugins
 from Products.ZenEvents.Event import Event, EventHeartbeat
 from Products.ZenEvents.ZenEventClasses import App_Start
 from Products.ZenMessaging.queuemessaging.interfaces import IEventPublisher
@@ -55,18 +54,23 @@ from Products.ZenHub.metricmanager import MetricManager
 from Products.ZenHub.invalidationmanager import InvalidationManager
 from Products.ZenHub.servicemanager import HubServiceManager
 
-# Due to the manipulation of sys.path during the loading of plugins,
-# we can get ObjectMap imported both as DataMaps.ObjectMap and the
-# full-path from Products.  The following gets the class registered
-# with the jelly serialization engine under both names:
-#
-#  1st: get Products.DataCollector.plugins.DataMaps.ObjectMap
-from Products.DataCollector.plugins.DataMaps import ObjectMap
-#  2nd: get DataMaps.ObjectMap
-sys.path.insert(0, zenPath('Products', 'DataCollector', 'plugins'))
-import DataMaps
 
-unused(Globals, DataMaps, ObjectMap)
+def _load_modules():
+    # Due to the manipulation of sys.path during the loading of plugins,
+    # we can get ObjectMap imported both as DataMaps.ObjectMap and the
+    # full-path from Products.  The following gets the class registered
+    # with the jelly serialization engine under both names:
+    #  1st: get Products.DataCollector.plugins.DataMaps.ObjectMap
+    from Products.DataCollector.plugins.DataMaps import ObjectMap
+    #  2nd: get DataMaps.ObjectMap
+    sys.path.insert(0, zenPath('Products', 'DataCollector', 'plugins'))
+    import DataMaps
+
+    unused(DataMaps, ObjectMap)
+
+
+_load_modules()
+unused(Globals)
 
 log = logging.getLogger('zen.ZenHub')
 
@@ -113,7 +117,7 @@ class ZenHub(ZCmdBase):
         self.shutdown = False
         self.counters = collections.Counter()
 
-        ZCmdBase.__init__(self)
+        super(ZenHub, self).__init__()
 
         import Products.ZenHub
         load_config("hub.zcml", Products.ZenHub)
@@ -407,5 +411,7 @@ class ParserReadyForOptionsEvent(object):
 
 
 if __name__ == '__main__':
+    # import pprint
+    # pprint.pprint(locals())
     from Products.ZenHub.zenhub import ZenHub
     ZenHub().main()
